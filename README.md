@@ -12,6 +12,19 @@ Install dependencies first:
 pip install picosdk numpy matplotlib scipy
 ```
 
+## User Guide:
+
+```zsh
+# uv workflow (recommended)
+uv sync                                  # install everything
+uv sync --extra dev                      # include dev tools too
+uv run ps5000a_bode_sweep.py
+
+# plain pip workflow
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # runtime only
+pip install -r requirements-dev.txt      # runtime + dev tools
+```
 
 ## Key Design Notes
 
