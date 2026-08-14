@@ -4,27 +4,26 @@ ps5000a_bode_sweep.py
 PicoScope 5000 Series — Swept-frequency Bode Plot (Gain & Phase)
 ================================================================================
 Setup
-  - Generator (AWG out) → your ASIC input, looped back to Channel A (1x probe)
+  - Generator (AWG out) → your ASIC input AND Channel D (x10 probe reference)
   - ASIC output+ → Channel B (x10 probe)
   - ASIC output- → Channel C (x10 probe)
-  - (B - C) represents the differential output of the ASIC
-
-Probe attenuation is declared at the top of this file under USER CONFIGURATION.
-The x10 factor is applied after ADC→mV conversion so that all computed
-voltages, gains, and CSV exports reflect the true signal amplitude at the
-probe tip rather than the attenuated voltage seen by the ADC input.
+  - Channel A     → unused (disabled)
+  - (B - C)       → differential ASIC output (CMRR-rejected)
+  - Gain and phase are computed as (B-C) relative to D
+  - All active channels are AC coupled
 
 What the script does
   1. Iterates over log-spaced frequencies from 10 kHz to 50 MHz
-  2. At each frequency the built-in sine generator is programmed via
+  2. At each step the built-in sine generator is programmed via
      ps5000aSetSigGenBuiltInV2 (software step-and-settle, no hardware sweep)
-  3. Three channels (A, B, C) are captured in block mode
+  3. Channels B, C, D are captured simultaneously in block mode
   4. Raw ADC counts are converted to mV then multiplied by the probe factor
-  5. FFT is computed for A and (B-C)
-  6. At the fundamental bin: gain [dB] and phase difference [°] are extracted
+  5. FFT is computed for D and (B-C)
+  6. At the fundamental bin: gain [dB] and phase difference [°] of
+     (B-C) relative to D are extracted
   7. All per-step results are accumulated in a pandas DataFrame and exported
      to a timestamped CSV after the sweep completes
-  8. A Bode plot (gain + phase vs log frequency) is saved as a PNG
+  8. A two-panel Bode plot (gain + phase vs log frequency) is saved as PNG
 
 Dependencies:  pip install picosdk numpy matplotlib scipy pandas
 ================================================================================
@@ -62,15 +61,18 @@ SETTLE_TIME_S   = 0.05          # seconds to wait after changing generator freq
 # 10  = 10x probe (probe tip voltage = ADC reading × 10)
 # 100 = 100x probe
 #
-# Channel A monitors the generator output directly → 1x
-# Channels B and C measure the ASIC output through 10x probes → 10
+# Channel A  → disabled (not used in this configuration)
+# Channel B  → ASIC output+  (10x probe)
+# Channel C  → ASIC output-  (10x probe)
+# Channel D  → generator monitor (10x probe) — gain/phase reference
 #
 # These factors are applied in software after adc2mV() conversion.
 # They do NOT affect the ADC input range selection (CH_RANGE_*); choose
 # the range that prevents clipping of the attenuated signal at the BNC input.
-PROBE_A = 1
-PROBE_B = 10
-PROBE_C = 10
+PROBE_A = 1     # Ch A disabled — value unused but declared for completeness
+PROBE_B = 10    # ASIC output+
+PROBE_C = 10    # ASIC output-
+PROBE_D = 10    # Generator monitor (gain/phase reference)
 
 # --- Voltage range indices ---------------------------------------------------
 # Select the tightest range that does not clip the attenuated BNC input.
@@ -80,9 +82,19 @@ PROBE_C = 10
 # PS5000A ranges:
 #   1=±20 mV  2=±50 mV  3=±100 mV  4=±200 mV  5=±500 mV
 #   6=±1 V    7=±2 V    8=±5 V     9=±10 V    10=±20 V
-CH_RANGE_A      = 7             # ±2 V at the BNC  (1x probe → ±2 V at tip)
-CH_RANGE_B      = 7             # ±2 V at the BNC (10x probe → ±20 V at tip)
-CH_RANGE_C      = 7             # ±2 V at the BNC (10x probe → ±20 V at tip)
+CH_RANGE_A      = 7             # unused — set to avoid SDK error on open
+CH_RANGE_B      = 7             # ±2 V at BNC (10x probe → ±20 V at tip)
+CH_RANGE_C      = 7             # ±2 V at BNC (10x probe → ±20 V at tip)
+CH_RANGE_D      = 7             # ±2 V at BNC (10x probe → ±20 V at tip)
+
+# --- Channel coupling --------------------------------------------------------
+# PS5000A_AC = 0  →  AC coupled (blocks DC, high-pass ~1 Hz corner)
+# PS5000A_DC = 1  →  DC coupled (full bandwidth including DC component)
+#
+# All channels are AC coupled to reject DC offsets and power-supply
+# common-mode noise from the ASIC supply rails. Switch to PS5000A_DC
+# if you need to measure absolute DC levels or signals below ~10 Hz.
+COUPLING        = ps.PS5000A_COUPLING["PS5000A_AC"]
 
 # --- Generator ---------------------------------------------------------------
 GEN_OFFSET_UV   = 0             # DC offset in µV
@@ -95,14 +107,6 @@ OUTPUT_DIR      = Path("outputs")
 # ──────────────────────────────────────────────────────────────────────────────
 # DERIVED CONSTANTS  (do not edit below this line)
 # ──────────────────────────────────────────────────────────────────────────────
-
-# Map channel → (range index, probe factor) for use in helpers
-_CH_CFG: dict[str, tuple[int, int]] = {
-    "A": (CH_RANGE_A, PROBE_A),
-    "B": (CH_RANGE_B, PROBE_B),
-    "C": (CH_RANGE_C, PROBE_C),
-}
-
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -124,26 +128,39 @@ except Exception:
         raise
 
 print("Device opened.")
-print(f"  Probe factors — Ch A: {PROBE_A}x  |  Ch B: {PROBE_B}x  |  Ch C: {PROBE_C}x")
+print(
+    f"  Coupling: AC  |  Probes — "
+    f"Ch A: disabled  |  Ch B: {PROBE_B}x  |  "
+    f"Ch C: {PROBE_C}x  |  Ch D: {PROBE_D}x (reference)"
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CHANNEL SETUP  (A, B, C on; D off to maximise timebase range)
+# CHANNEL SETUP
+# A → disabled  |  B → ASIC output+  |  C → ASIC output-  |  D → reference
+# All active channels: AC coupled, per COUPLING constant above.
+#
+# NOTE: On quad-channel models (5443B, 5444B) all four channels are available
+# on USB power. On dual-channel models (5242B, 5243B, 5244B) only A and B are
+# available; connect the external PSU to unlock C and D.
 # ──────────────────────────────────────────────────────────────────────────────
 CH_A = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_A"]
 CH_B = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_B"]
 CH_C = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_C"]
 CH_D = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_D"]
-DC   = ps.PS5000A_COUPLING["PS5000A_DC"]
 
-# Each channel is configured with its own range index
 for ch_enum, en, range_idx in [
-    (CH_A, 1, CH_RANGE_A),
-    (CH_B, 1, CH_RANGE_B),
-    (CH_C, 1, CH_RANGE_C),
-    (CH_D, 0, CH_RANGE_A),     # range irrelevant for disabled channel
+    (CH_A, 0, CH_RANGE_A),      # disabled
+    (CH_B, 1, CH_RANGE_B),      # ASIC output+,  AC coupled, 10x probe
+    (CH_C, 1, CH_RANGE_C),      # ASIC output-,  AC coupled, 10x probe
+    (CH_D, 1, CH_RANGE_D),      # generator ref, AC coupled, 10x probe
 ]:
     status[f"setCh{ch_enum}"] = ps.ps5000aSetChannel(
-        chandle, ch_enum, en, DC, range_idx, ctypes.c_float(0.0)
+        chandle,
+        ch_enum,
+        en,
+        COUPLING,       # PS5000A_AC applied to all channels uniformly
+        range_idx,
+        ctypes.c_float(0.0)
     )
     assert_pico_ok(status[f"setCh{ch_enum}"])
 
@@ -194,13 +211,14 @@ def find_timebase(target_fs_hz: float, n_samples: int) -> tuple[int, float]:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BLOCK CAPTURE HELPER
-# Returns probe-corrected waveforms in mV (true probe-tip voltage)
+# Returns probe-corrected waveforms in mV (true probe-tip voltage).
+# Ch D is the gain/phase reference; Ch A is not captured.
 # ──────────────────────────────────────────────────────────────────────────────
 def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, int]:
     """
-    Arm, trigger, and retrieve one block capture from channels A, B, C.
-    Applies per-channel probe attenuation correction after adc2mV conversion
-    so that the returned arrays represent the true signal at the probe tip.
+    Arm, trigger, and retrieve one block capture from channels B, C, D.
+    Applies per-channel probe attenuation after adc2mV conversion so that
+    returned arrays represent the true signal at the probe tip.
 
     Parameters
     ----------
@@ -209,8 +227,9 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
 
     Returns
     -------
-    chA_mV, chB_mV, chC_mV : np.ndarray
+    chB_mV, chC_mV, chD_mV : np.ndarray
         Probe-tip voltages in millivolts (attenuation-corrected).
+        chD_mV is the generator monitor (reference channel).
     dt_ns : float
         Sample interval in nanoseconds.
     tb : int
@@ -219,9 +238,10 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
     tb, dt_ns  = find_timebase(freq_hz, N_SAMPLES)
     RATIO_NONE = ps.PS5000A_RATIO_MODE["PS5000A_RATIO_MODE_NONE"]
 
-    # Simple rising-edge trigger on Ch A, threshold 0 V, auto after 1 000 ms
+    # Trigger on Ch D (generator monitor), rising edge, threshold 0 V,
+    # auto-trigger after 1 000 ms to prevent indefinite blocking.
     status["trig"] = ps.ps5000aSetSimpleTrigger(
-        chandle, 1, CH_A, 0, 2, 0, 1000
+        chandle, 1, CH_D, 0, 2, 0, 1000
     )
     assert_pico_ok(status["trig"])
 
@@ -235,11 +255,11 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
         ps.ps5000aIsReady(chandle, ctypes.byref(ready))
         time.sleep(0.001)
 
-    bufA = (ctypes.c_int16 * N_SAMPLES)()
     bufB = (ctypes.c_int16 * N_SAMPLES)()
     bufC = (ctypes.c_int16 * N_SAMPLES)()
+    bufD = (ctypes.c_int16 * N_SAMPLES)()
 
-    for ch_enum, buf in [(CH_A, bufA), (CH_B, bufB), (CH_C, bufC)]:
+    for ch_enum, buf in [(CH_B, bufB), (CH_C, bufC), (CH_D, bufD)]:
         status[f"setBuf{ch_enum}"] = ps.ps5000aSetDataBuffer(
             chandle, ch_enum, ctypes.byref(buf), N_SAMPLES, 0, RATIO_NONE
         )
@@ -252,13 +272,13 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
     )
     assert_pico_ok(status["getValues"])
 
-    # Convert ADC counts → BNC millivolts, then scale by probe factor
-    # adc2mV uses the ADC range index that was set on the channel
-    chA_mV = np.array(adc2mV(bufA, CH_RANGE_A, maxADC), dtype=np.float64) * PROBE_A
+    # adc2mV converts ADC counts → BNC socket millivolts.
+    # Multiplying by the probe factor recovers the true probe-tip voltage.
     chB_mV = np.array(adc2mV(bufB, CH_RANGE_B, maxADC), dtype=np.float64) * PROBE_B
     chC_mV = np.array(adc2mV(bufC, CH_RANGE_C, maxADC), dtype=np.float64) * PROBE_C
+    chD_mV = np.array(adc2mV(bufD, CH_RANGE_D, maxADC), dtype=np.float64) * PROBE_D
 
-    return chA_mV, chB_mV, chC_mV, dt_ns, tb
+    return chB_mV, chC_mV, chD_mV, dt_ns, tb
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FFT HELPER
@@ -301,11 +321,15 @@ rows: list[dict] = []
 
 print(f"\nStarting frequency sweep: {FREQ_START_HZ/1e3:.1f} kHz → {FREQ_STOP_HZ/1e6:.0f} MHz")
 print(
-    f"{'Freq (Hz)':>14}  {'Actual (Hz)':>12}  {'Gain (dB)':>10}  "
-    f"{'Phase (deg)':>12}  {'chA RMS (mV)':>13}  {'BC RMS (mV)':>12}  "
+    f"  Reference channel: D ({PROBE_D}x probe)  |  "
+    f"Signal: (B−C)  (B={PROBE_B}x, C={PROBE_C}x)  |  Coupling: AC"
+)
+print(
+    f"\n{'Freq (Hz)':>14}  {'Actual (Hz)':>12}  {'Gain (dB)':>10}  "
+    f"{'Phase (deg)':>12}  {'D RMS (mV)':>11}  {'BC RMS (mV)':>12}  "
     f"{'dt (ns)':>9}  {'TB':>4}"
 )
-print("-" * 108)
+print("-" * 112)
 
 for freq in frequencies:
     # ── 1. Program generator ─────────────────────────────────────────────────
@@ -325,37 +349,37 @@ for freq in frequencies:
     time.sleep(SETTLE_TIME_S)
 
     # ── 2. Capture (probe-corrected) ─────────────────────────────────────────
-    chA, chB, chC, dt_ns, tb = capture_block(freq)
+    chB, chC, chD, dt_ns, tb = capture_block(freq)
     diff_BC = chB - chC
 
-    # ── 3. FFT ───────────────────────────────────────────────────────────────
-    _, Y_A  = compute_fft(chA,     dt_ns)
+    # ── 3. FFT of reference (D) and differential output (B-C) ───────────────
+    f_D,    Y_D  = compute_fft(chD,     dt_ns)
     f_diff, Y_BC = compute_fft(diff_BC, dt_ns)
 
     # ── 4. Locate fundamental bin ────────────────────────────────────────────
     fund_bin = np.argmin(np.abs(f_diff - freq))
-    A_fund   = Y_A[fund_bin]
+    D_fund   = Y_D[fund_bin]
     BC_fund  = Y_BC[fund_bin]
 
-    mag_A  = np.abs(A_fund)
+    mag_D  = np.abs(D_fund)
     mag_BC = np.abs(BC_fund)
 
-    # ── 5. Gain and phase ────────────────────────────────────────────────────
-    if mag_A < 1e-12:
+    # ── 5. Gain and phase of (B-C) relative to D ─────────────────────────────
+    if mag_D < 1e-12:
         gain_db   = np.nan
         phase_deg = np.nan
     else:
-        gain_db   = 20.0 * np.log10(mag_BC / mag_A)
-        phase_rad = np.angle(BC_fund) - np.angle(A_fund)
+        gain_db   = 20.0 * np.log10(mag_BC / mag_D)
+        phase_rad = np.angle(BC_fund) - np.angle(D_fund)
         phase_deg = float(np.degrees(np.unwrap([phase_rad])[0]))
 
-    actual_freq  = float(f_diff[fund_bin])
-    chA_rms_mV   = float(np.sqrt(np.mean(chA ** 2)))
-    BC_rms_mV    = float(np.sqrt(np.mean(diff_BC ** 2)))
+    actual_freq = float(f_diff[fund_bin])
+    D_rms_mV    = float(np.sqrt(np.mean(chD ** 2)))
+    BC_rms_mV   = float(np.sqrt(np.mean(diff_BC ** 2)))
 
     print(
         f"{freq:14.1f}  {actual_freq:12.1f}  {gain_db:10.3f}  "
-        f"{phase_deg:12.3f}  {chA_rms_mV:13.4f}  {BC_rms_mV:12.4f}  "
+        f"{phase_deg:12.3f}  {D_rms_mV:11.4f}  {BC_rms_mV:12.4f}  "
         f"{dt_ns:9.3f}  {tb:4d}"
     )
 
@@ -365,32 +389,33 @@ for freq in frequencies:
         "timestamp":                RUN_TIMESTAMP,
         "set_freq_hz":              float(freq),
         "actual_fund_freq_hz":      actual_freq,
-        # Primary results
+        # Primary results — (B-C) relative to D
         "gain_dB":                  gain_db,
         "phase_deg":                phase_deg,
         # Waveform statistics (probe-tip corrected)
-        "chA_rms_mV":               chA_rms_mV,
         "chB_rms_mV":               float(np.sqrt(np.mean(chB ** 2))),
         "chC_rms_mV":               float(np.sqrt(np.mean(chC ** 2))),
+        "chD_rms_mV":               D_rms_mV,
         "diff_BC_rms_mV":           BC_rms_mV,
-        "chA_peak_mV":              float(np.max(np.abs(chA))),
         "chB_peak_mV":              float(np.max(np.abs(chB))),
         "chC_peak_mV":              float(np.max(np.abs(chC))),
+        "chD_peak_mV":              float(np.max(np.abs(chD))),
         "diff_BC_peak_mV":          float(np.max(np.abs(diff_BC))),
-        "fft_mag_A_at_fund_mV":     float(mag_A),
+        "fft_mag_D_at_fund_mV":     float(mag_D),
         "fft_mag_BC_at_fund_mV":    float(mag_BC),
         "fund_bin_index":           int(fund_bin),
         # Acquisition parameters
         "sample_interval_ns":       dt_ns,
         "timebase_index":           tb,
         "n_samples":                N_SAMPLES,
-        # Probe configuration (recorded for traceability)
-        "probe_A":                  PROBE_A,
+        # Probe and coupling configuration (recorded for traceability)
+        "coupling":                 "AC",
         "probe_B":                  PROBE_B,
         "probe_C":                  PROBE_C,
-        "ch_range_A":               CH_RANGE_A,
+        "probe_D":                  PROBE_D,
         "ch_range_B":               CH_RANGE_B,
         "ch_range_C":               CH_RANGE_C,
+        "ch_range_D":               CH_RANGE_D,
         # Generator configuration
         "gen_pk2pk_uV":             GEN_PK2PK_UV,
         "gen_offset_uV":            GEN_OFFSET_UV,
@@ -413,26 +438,27 @@ df = df.astype({
     "actual_fund_freq_hz":      "float64",
     "gain_dB":                  "float64",
     "phase_deg":                "float64",
-    "chA_rms_mV":               "float64",
     "chB_rms_mV":               "float64",
     "chC_rms_mV":               "float64",
+    "chD_rms_mV":               "float64",
     "diff_BC_rms_mV":           "float64",
-    "chA_peak_mV":              "float64",
     "chB_peak_mV":              "float64",
     "chC_peak_mV":              "float64",
+    "chD_peak_mV":              "float64",
     "diff_BC_peak_mV":          "float64",
-    "fft_mag_A_at_fund_mV":     "float64",
+    "fft_mag_D_at_fund_mV":     "float64",
     "fft_mag_BC_at_fund_mV":    "float64",
     "fund_bin_index":           "int64",
     "sample_interval_ns":       "float64",
     "timebase_index":           "int64",
     "n_samples":                "int64",
-    "probe_A":                  "int64",
+    "coupling":                 "string",
     "probe_B":                  "int64",
     "probe_C":                  "int64",
-    "ch_range_A":               "int64",
+    "probe_D":                  "int64",
     "ch_range_B":               "int64",
     "ch_range_C":               "int64",
+    "ch_range_D":               "int64",
     "gen_pk2pk_uV":             "int64",
     "gen_offset_uV":            "int64",
 })
@@ -447,16 +473,16 @@ print(df[["set_freq_hz", "gain_dB", "phase_deg"]].to_string(index=False))
 # ──────────────────────────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
 fig.suptitle(
-    f"Bode Plot — (B−C) vs A  |  PicoScope 5000 Series\n"
+    f"Bode Plot — (B−C) vs D  |  PicoScope 5000 Series\n"
     f"Run: {RUN_TIMESTAMP}  |  {N_FREQ_POINTS} points  |  "
-    f"{GEN_PK2PK_UV/1e6:.1f} Vpp  |  12-bit  |  "
-    f"Probes: A={PROBE_A}x  B={PROBE_B}x  C={PROBE_C}x",
+    f"{GEN_PK2PK_UV/1e6:.1f} Vpp  |  12-bit  |  AC coupled  |  "
+    f"Probes: B={PROBE_B}x  C={PROBE_C}x  D={PROBE_D}x (ref)",
     fontsize=11
 )
 
 ax1.semilogx(
     df["set_freq_hz"], df["gain_dB"],
-    "b.-", linewidth=1.5, markersize=5, label="Gain (B−C)/A"
+    "b.-", linewidth=1.5, markersize=5, label="Gain (B−C) / D"
 )
 ax1.set_ylabel("Gain (dB)")
 ax1.grid(True, which="both", linestyle="--", alpha=0.6)
@@ -465,7 +491,7 @@ ax1.legend(fontsize=9)
 
 ax2.semilogx(
     df["set_freq_hz"], df["phase_deg"],
-    "r.-", linewidth=1.5, markersize=5, label="Phase (B−C) − A"
+    "r.-", linewidth=1.5, markersize=5, label="Phase (B−C) − D"
 )
 ax2.set_ylabel("Phase (degrees)")
 ax2.set_xlabel("Frequency (Hz)")
