@@ -4,17 +4,16 @@ ps5000a_spectral_metrics.py
 PicoScope 5000 Series — SNR, SINAD, THD, HD2, HD3 of (B−C) differential output
 ================================================================================
 Setup
-  - Generator (AWG out) → your ASIC input, looped back to Channel A (1x probe)
+  - Generator (AWG out) → your ASIC input AND Channel D (x10 probe reference)
   - ASIC output+ → Channel B (x10 probe)
   - ASIC output- → Channel C (x10 probe)
-
-Probe attenuation is declared at the top of this file under USER CONFIGURATION.
-The x10 factor is applied after ADC→mV conversion so that all metrics,
-amplitudes, and CSV exports reflect the true signal at the probe tip.
+  - Channel A     → unused (disabled)
+  - (B - C)       → differential ASIC output (CMRR-rejected)
+  - All active channels are AC coupled
 
 What the script does
   1. Programs the generator at each of three test frequencies
-  2. Captures channels A, B, C in block mode
+  2. Captures channels B, C, D in block mode (A disabled)
   3. Applies per-channel probe correction to raw ADC data
   4. Computes FFT of (B - C) with Blackman-Harris windowing
   5. Computes SNR, SINAD, THD, HD2, HD3 in dB
@@ -48,9 +47,9 @@ from picosdk.functions import adc2mV, assert_pico_ok
 TEST_FREQUENCIES_HZ = [100_000, 1_000_000, 10_000_000]   # 100 kHz, 1 MHz, 10 MHz
 
 # --- Capture parameters ------------------------------------------------------
-N_SAMPLES    = 16384        # power-of-2; larger → finer spectral bins
-N_HARMONICS  = 5            # harmonics included in THD: H2 … H(N_HARMONICS+1)
-GUARD_BINS   = 3            # bins excluded either side of each harmonic
+N_SAMPLES     = 16384       # power-of-2; larger → finer spectral bins
+N_HARMONICS   = 5           # harmonics included in THD: H2 … H(N_HARMONICS+1)
+GUARD_BINS    = 3           # bins excluded either side of each harmonic
 SETTLE_TIME_S = 0.10        # settle after generator frequency change
 
 # --- Probe attenuation -------------------------------------------------------
@@ -59,15 +58,18 @@ SETTLE_TIME_S = 0.10        # settle after generator frequency change
 # 10  = 10x probe (probe tip voltage = ADC reading × 10)
 # 100 = 100x probe
 #
-# Channel A monitors the generator output directly → 1x
-# Channels B and C measure the ASIC output through 10x probes → 10
+# Channel A  → disabled (not used in this configuration)
+# Channel B  → ASIC output+  (10x probe)
+# Channel C  → ASIC output-  (10x probe)
+# Channel D  → generator monitor (10x probe) — reference channel
 #
 # These factors are applied in software after adc2mV() conversion.
 # They do NOT affect the ADC input range selection (CH_RANGE_*); choose
 # the range that prevents clipping of the attenuated signal at the BNC input.
-PROBE_A = 1
-PROBE_B = 10
-PROBE_C = 10
+PROBE_A = 1     # Ch A disabled — value unused but declared for completeness
+PROBE_B = 10    # ASIC output+
+PROBE_C = 10    # ASIC output-
+PROBE_D = 10    # Generator monitor (reference)
 
 # --- Voltage range indices ---------------------------------------------------
 # Select the tightest range that does not clip the attenuated BNC input.
@@ -77,12 +79,22 @@ PROBE_C = 10
 # PS5000A ranges:
 #   1=±20 mV  2=±50 mV  3=±100 mV  4=±200 mV  5=±500 mV
 #   6=±1 V    7=±2 V    8=±5 V     9=±10 V    10=±20 V
-CH_RANGE_A   = 7            # ±2 V at BNC  (1x  probe → ±2 V  at tip)
-CH_RANGE_B   = 7            # ±2 V at BNC  (10x probe → ±20 V at tip)
-CH_RANGE_C   = 7            # ±2 V at BNC  (10x probe → ±20 V at tip)
+CH_RANGE_A    = 7           # unused — set to avoid SDK error on open
+CH_RANGE_B    = 7           # ±2 V at BNC (10x probe → ±20 V at tip)
+CH_RANGE_C    = 7           # ±2 V at BNC (10x probe → ±20 V at tip)
+CH_RANGE_D    = 7           # ±2 V at BNC (10x probe → ±20 V at tip)
+
+# --- Channel coupling --------------------------------------------------------
+# PS5000A_AC = 0  →  AC coupled (blocks DC, high-pass ~1 Hz corner)
+# PS5000A_DC = 1  →  DC coupled (full bandwidth including DC component)
+#
+# All channels are AC coupled to reject DC offsets and power-supply
+# common-mode noise from the ASIC supply rails. Switch to PS5000A_DC
+# if you need to measure absolute DC levels or signals below ~10 Hz.
+COUPLING      = ps.PS5000A_COUPLING["PS5000A_AC"]
 
 # --- Generator ---------------------------------------------------------------
-GEN_PK2PK_UV  = 2_000_000   # 2 Vpp
+GEN_PK2PK_UV  = 2_000_000  # 2 Vpp
 GEN_OFFSET_UV = 0
 RESOLUTION    = ps.PS5000A_DEVICE_RESOLUTION["PS5000A_DR_12BIT"]
 
@@ -113,25 +125,39 @@ except Exception:
         raise
 
 print("Device opened.")
-print(f"  Probe factors — Ch A: {PROBE_A}x  |  Ch B: {PROBE_B}x  |  Ch C: {PROBE_C}x")
+print(
+    f"  Coupling: AC  |  Probes — "
+    f"Ch A: disabled  |  Ch B: {PROBE_B}x  |  "
+    f"Ch C: {PROBE_C}x  |  Ch D: {PROBE_D}x (reference)"
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CHANNEL SETUP
+# A → disabled  |  B → ASIC output+  |  C → ASIC output-  |  D → reference
+# All active channels: AC coupled, per COUPLING constant above.
+#
+# NOTE: On quad-channel models (5443B, 5444B) all four channels are available
+# on USB power. On dual-channel models (5242B, 5243B, 5244B) only A and B are
+# available; connect the external PSU to unlock C and D.
 # ──────────────────────────────────────────────────────────────────────────────
 CH_A = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_A"]
 CH_B = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_B"]
 CH_C = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_C"]
 CH_D = ps.PS5000A_CHANNEL["PS5000A_CHANNEL_D"]
-DC   = ps.PS5000A_COUPLING["PS5000A_DC"]
 
 for ch_enum, en, range_idx in [
-    (CH_A, 1, CH_RANGE_A),
-    (CH_B, 1, CH_RANGE_B),
-    (CH_C, 1, CH_RANGE_C),
-    (CH_D, 0, CH_RANGE_A),
+    (CH_A, 0, CH_RANGE_A),      # disabled
+    (CH_B, 1, CH_RANGE_B),      # ASIC output+,  AC coupled, 10x probe
+    (CH_C, 1, CH_RANGE_C),      # ASIC output-,  AC coupled, 10x probe
+    (CH_D, 1, CH_RANGE_D),      # generator ref, AC coupled, 10x probe
 ]:
     status[f"setCh{ch_enum}"] = ps.ps5000aSetChannel(
-        chandle, ch_enum, en, DC, range_idx, ctypes.c_float(0.0)
+        chandle,
+        ch_enum,
+        en,
+        COUPLING,       # PS5000A_AC applied to all channels uniformly
+        range_idx,
+        ctypes.c_float(0.0)
     )
     assert_pico_ok(status[f"setCh{ch_enum}"])
 
@@ -180,13 +206,14 @@ def find_timebase(target_fs_hz: float, n_samples: int) -> tuple[int, float]:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BLOCK CAPTURE HELPER
-# Returns probe-corrected waveforms in mV (true probe-tip voltage)
+# Returns probe-corrected waveforms in mV (true probe-tip voltage).
+# Ch D is the reference; Ch A is not captured.
 # ──────────────────────────────────────────────────────────────────────────────
 def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, int]:
     """
-    Arm and retrieve one block capture from channels A, B, C.
-    Applies per-channel probe attenuation correction after adc2mV conversion
-    so that returned arrays represent the true signal at the probe tip.
+    Arm and retrieve one block capture from channels B, C, D.
+    Applies per-channel probe attenuation after adc2mV conversion so that
+    returned arrays represent the true signal at the probe tip.
 
     Parameters
     ----------
@@ -195,8 +222,9 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
 
     Returns
     -------
-    chA_mV, chB_mV, chC_mV : np.ndarray
+    chB_mV, chC_mV, chD_mV : np.ndarray
         Probe-tip voltages in millivolts (attenuation-corrected).
+        chD_mV is the generator monitor reference.
     dt_ns : float
         Sample interval in nanoseconds.
     tb : int
@@ -205,8 +233,10 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
     tb, dt_ns  = find_timebase(freq_hz, N_SAMPLES)
     RATIO_NONE = ps.PS5000A_RATIO_MODE["PS5000A_RATIO_MODE_NONE"]
 
+    # Trigger on Ch D (generator monitor), rising edge, threshold 0 V,
+    # auto-trigger after 1 000 ms to prevent indefinite blocking.
     status["trig"] = ps.ps5000aSetSimpleTrigger(
-        chandle, 1, CH_A, 0, 2, 0, 1000
+        chandle, 1, CH_D, 0, 2, 0, 1000
     )
     assert_pico_ok(status["trig"])
 
@@ -220,11 +250,11 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
         ps.ps5000aIsReady(chandle, ctypes.byref(ready))
         time.sleep(0.001)
 
-    bufA = (ctypes.c_int16 * N_SAMPLES)()
     bufB = (ctypes.c_int16 * N_SAMPLES)()
     bufC = (ctypes.c_int16 * N_SAMPLES)()
+    bufD = (ctypes.c_int16 * N_SAMPLES)()
 
-    for ch_enum, buf in [(CH_A, bufA), (CH_B, bufB), (CH_C, bufC)]:
+    for ch_enum, buf in [(CH_B, bufB), (CH_C, bufC), (CH_D, bufD)]:
         status[f"setBuf{ch_enum}"] = ps.ps5000aSetDataBuffer(
             chandle, ch_enum, ctypes.byref(buf), N_SAMPLES, 0, RATIO_NONE
         )
@@ -237,13 +267,13 @@ def capture_block(freq_hz: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
     )
     assert_pico_ok(status["getValues"])
 
-    # adc2mV converts ADC counts to the voltage at the BNC socket.
+    # adc2mV converts ADC counts → BNC socket millivolts.
     # Multiplying by the probe factor recovers the true probe-tip voltage.
-    chA_mV = np.array(adc2mV(bufA, CH_RANGE_A, maxADC), dtype=np.float64) * PROBE_A
     chB_mV = np.array(adc2mV(bufB, CH_RANGE_B, maxADC), dtype=np.float64) * PROBE_B
     chC_mV = np.array(adc2mV(bufC, CH_RANGE_C, maxADC), dtype=np.float64) * PROBE_C
+    chD_mV = np.array(adc2mV(bufD, CH_RANGE_D, maxADC), dtype=np.float64) * PROBE_D
 
-    return chA_mV, chB_mV, chC_mV, dt_ns, tb
+    return chB_mV, chC_mV, chD_mV, dt_ns, tb
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SPECTRAL METRICS COMPUTATION
@@ -261,7 +291,7 @@ def spectral_metrics(
     Uses a Blackman-Harris window (−92 dB sidelobes) to suppress spectral
     leakage so low-level harmonic products are not masked.
 
-    Input signal is expected to be probe-tip corrected (true mV at DUT).
+    Input signal is expected to be probe-tip corrected (true mV at DUT output).
 
     Parameters
     ----------
@@ -317,7 +347,7 @@ def spectral_metrics(
     H2 = harmonic_mags_mV[0] if len(harmonic_mags_mV) > 0 else 0.0
     H3 = harmonic_mags_mV[1] if len(harmonic_mags_mV) > 1 else 0.0
 
-    # ── Signal mask ──────────────────────────────────────────────────────────
+    # ── Signal mask (fundamental + harmonics ± guard) ────────────────────────
     n_fft    = len(mag)
     sig_mask = np.zeros(n_fft, dtype=bool)
     for hb in [fund_bin] + harmonic_bins:
@@ -325,10 +355,12 @@ def spectral_metrics(
         hi_g = min(n_fft - 1, hb + guard_bins)
         sig_mask[lo_g:hi_g + 1] = True
 
-    noise_mask             = ~sig_mask
+    # ── Noise floor (excludes DC, fundamental, harmonics) ────────────────────
+    noise_mask              = ~sig_mask
     noise_mask[:guard_bins] = False
     noise_rms = float(np.sqrt(np.sum(mag[noise_mask] ** 2)))
 
+    # ── Harmonic + noise (SINAD denominator) ─────────────────────────────────
     harm_mask = np.zeros(n_fft, dtype=bool)
     for hb in harmonic_bins:
         lo_g = max(0, hb - guard_bins)
@@ -414,11 +446,11 @@ for ax, freq in zip(axes, TEST_FREQUENCIES_HZ):
     time.sleep(SETTLE_TIME_S)
 
     # ── Capture (probe-corrected) ─────────────────────────────────────────────
-    chA, chB, chC, dt_ns, tb = capture_block(freq)
+    chB, chC, chD, dt_ns, tb = capture_block(freq)
     diff_BC = chB - chC
     t_us    = np.arange(N_SAMPLES) * dt_ns / 1e3
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
+    # ── Metrics on (B-C) ─────────────────────────────────────────────────────
     m = spectral_metrics(
         diff_BC, dt_ns, freq,
         n_harmonics=N_HARMONICS, guard_bins=GUARD_BINS
@@ -447,28 +479,28 @@ for ax, freq in zip(axes, TEST_FREQUENCIES_HZ):
         "timestamp":                RUN_TIMESTAMP,
         "set_freq_hz":              float(freq),
         "actual_fund_freq_hz":      m["fund_freq_hz"],
-        # Primary metrics
+        # Primary metrics (computed on B-C)
         "SNR_dB":                   m["SNR_dB"],
         "SINAD_dB":                 m["SINAD_dB"],
         "THD_dB":                   m["THD_dB"],
         "HD2_dB":                   m["HD2_dB"],
         "HD3_dB":                   m["HD3_dB"],
-        # Amplitudes (probe-tip corrected)
+        # Amplitudes — probe-tip corrected
         "H1_mag_mV":                m["fund_mag_mV"],
         "H2_mag_mV":                m["H2_mag_mV"],
         "H3_mag_mV":                m["H3_mag_mV"],
         "noise_rms_mV":             m["noise_rms_mV"],
         "harm_noise_rms_mV":        m["harm_noise_rms_mV"],
-        # Waveform statistics (probe-tip corrected)
-        "chA_rms_mV":               float(np.sqrt(np.mean(chA ** 2))),
+        # Waveform statistics — probe-tip corrected
         "chB_rms_mV":               float(np.sqrt(np.mean(chB ** 2))),
         "chC_rms_mV":               float(np.sqrt(np.mean(chC ** 2))),
+        "chD_rms_mV":               float(np.sqrt(np.mean(chD ** 2))),
         "diff_BC_rms_mV":           float(np.sqrt(np.mean(diff_BC ** 2))),
-        "chA_peak_mV":              float(np.max(np.abs(chA))),
         "chB_peak_mV":              float(np.max(np.abs(chB))),
         "chC_peak_mV":              float(np.max(np.abs(chC))),
+        "chD_peak_mV":              float(np.max(np.abs(chD))),
         "diff_BC_peak_mV":          float(np.max(np.abs(diff_BC))),
-        "chA_dc_offset_mV":         float(np.mean(chA)),
+        "chD_dc_offset_mV":         float(np.mean(chD)),
         "diff_BC_dc_offset_mV":     float(np.mean(diff_BC)),
         # Acquisition parameters
         "sample_rate_hz":           m["fs_hz"],
@@ -476,13 +508,14 @@ for ax, freq in zip(axes, TEST_FREQUENCIES_HZ):
         "freq_resolution_hz":       m["df_hz"],
         "n_samples":                N_SAMPLES,
         "timebase_index":           tb,
-        # Probe configuration (recorded for traceability)
-        "probe_A":                  PROBE_A,
+        # Probe and coupling configuration — recorded for full traceability
+        "coupling":                 "AC",
         "probe_B":                  PROBE_B,
         "probe_C":                  PROBE_C,
-        "ch_range_A":               CH_RANGE_A,
+        "probe_D":                  PROBE_D,
         "ch_range_B":               CH_RANGE_B,
         "ch_range_C":               CH_RANGE_C,
+        "ch_range_D":               CH_RANGE_D,
         # Generator configuration
         "gen_pk2pk_uV":             GEN_PK2PK_UV,
         "gen_offset_uV":            GEN_OFFSET_UV,
@@ -492,16 +525,16 @@ for ax, freq in zip(axes, TEST_FREQUENCIES_HZ):
         **harmonic_cols,
     })
 
-    # ── Waveform rows ─────────────────────────────────────────────────────────
+    # ── Waveform rows — all three captured channels per sample ────────────────
     for i in range(N_SAMPLES):
         waveform_rows.append({
             "timestamp":   RUN_TIMESTAMP,
             "set_freq_hz": float(freq),
             "sample_idx":  i,
             "time_us":     float(t_us[i]),
-            "chA_mV":      float(chA[i]),       # probe-tip corrected
             "chB_mV":      float(chB[i]),       # probe-tip corrected
             "chC_mV":      float(chC[i]),       # probe-tip corrected
+            "chD_mV":      float(chD[i]),       # probe-tip corrected (reference)
             "diff_BC_mV":  float(diff_BC[i]),   # probe-tip corrected
         })
 
@@ -526,7 +559,7 @@ for ax, freq in zip(axes, TEST_FREQUENCIES_HZ):
         f"f = {freq/1e3:.0f} kHz  |  SNR = {m['SNR_dB']:.1f} dB  "
         f"SINAD = {m['SINAD_dB']:.1f} dB  THD = {m['THD_dB']:.1f} dB  "
         f"HD2 = {m['HD2_dB']:.1f} dB  HD3 = {m['HD3_dB']:.1f} dB  "
-        f"|  Probes B/C: {PROBE_B}x",
+        f"|  AC coupled  |  Ref: D ({PROBE_D}x)  Signal: B−C ({PROBE_B}x/{PROBE_C}x)",
         fontsize=9
     )
     ax.set_xlabel("Frequency (kHz)")
@@ -556,13 +589,14 @@ fixed_cols = [
     "SNR_dB", "SINAD_dB", "THD_dB", "HD2_dB", "HD3_dB",
     "H1_mag_mV", "H2_mag_mV", "H3_mag_mV",
     "noise_rms_mV", "harm_noise_rms_mV",
-    "chA_rms_mV", "chB_rms_mV", "chC_rms_mV", "diff_BC_rms_mV",
-    "chA_peak_mV", "chB_peak_mV", "chC_peak_mV", "diff_BC_peak_mV",
-    "chA_dc_offset_mV", "diff_BC_dc_offset_mV",
+    "chB_rms_mV", "chC_rms_mV", "chD_rms_mV", "diff_BC_rms_mV",
+    "chB_peak_mV", "chC_peak_mV", "chD_peak_mV", "diff_BC_peak_mV",
+    "chD_dc_offset_mV", "diff_BC_dc_offset_mV",
     "sample_rate_hz", "sample_interval_ns", "freq_resolution_hz",
     "n_samples", "timebase_index",
-    "probe_A", "probe_B", "probe_C",
-    "ch_range_A", "ch_range_B", "ch_range_C",
+    "coupling",
+    "probe_B", "probe_C", "probe_D",
+    "ch_range_B", "ch_range_C", "ch_range_D",
     "gen_pk2pk_uV", "gen_offset_uV", "n_harmonics", "guard_bins",
 ]
 dynamic_cols = [c for c in df_summary.columns if c not in fixed_cols]
@@ -574,9 +608,9 @@ df_waveforms = pd.DataFrame(waveform_rows).astype({
     "set_freq_hz": "float64",
     "sample_idx":  "int64",
     "time_us":     "float64",
-    "chA_mV":      "float64",
     "chB_mV":      "float64",
     "chC_mV":      "float64",
+    "chD_mV":      "float64",
     "diff_BC_mV":  "float64",
 })
 
@@ -599,7 +633,7 @@ print("\n── Summary ──────────────────�
 print(df_summary[[
     "set_freq_hz", "SNR_dB", "SINAD_dB", "THD_dB",
     "HD2_dB", "HD3_dB", "H1_mag_mV", "H2_mag_mV", "H3_mag_mV",
-    "probe_B", "probe_C", "noise_rms_mV",
+    "chD_rms_mV", "coupling", "probe_B", "probe_C", "probe_D",
 ]].to_string(index=False))
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -608,8 +642,8 @@ print(df_summary[[
 plt.suptitle(
     f"Spectral Metrics — (B−C) Differential Output  |  PicoScope 5000 Series\n"
     f"Run: {RUN_TIMESTAMP}  |  {N_SAMPLES} samples  |  "
-    f"{GEN_PK2PK_UV/1e6:.1f} Vpp  |  12-bit  |  Blackman-Harris  |  "
-    f"Probes: A={PROBE_A}x  B={PROBE_B}x  C={PROBE_C}x",
+    f"{GEN_PK2PK_UV/1e6:.1f} Vpp  |  12-bit  |  Blackman-Harris  |  AC coupled  |  "
+    f"Probes: B={PROBE_B}x  C={PROBE_C}x  D={PROBE_D}x (ref)",
     fontsize=11
 )
 plt.tight_layout()
